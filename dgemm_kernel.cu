@@ -41,7 +41,7 @@ public:
     assert(warpSize == 32 && blockDim.x == 32);
     assert(K <= (1LL << (4 + sizeof(unsigned) * CHAR_BIT)));
     for (unsigned i = 0; i < MDiv32; ++i) {
-      if (block_mlen <= 32u * i) m_tasks[i] = 0;
+      if (block_mlen <= 32u * i + m_subM) m_tasks[i] = 0;
       else if (m_subK >= K) m_tasks[i] = 0;
       else m_tasks[i] = (K - m_subK + 15u) >> 4;
     }
@@ -69,6 +69,11 @@ public:
   }
 }; // class MemTransferA
 
+#if __CUDA_ARCH__ >= 800
+#pragma message "enable tensor-core fp64 acceleration"
+#define DGEMM_USE_TENSOR_CORE
+#endif
+
 class Accumulator {
   double c00, c01, c02, c03;
   double c10, c11, c12, c13;
@@ -78,10 +83,15 @@ class Accumulator {
   double c50, c51, c52, c53;
   double c60, c61, c62, c63;
   double c70, c71, c72, c73;
+#ifdef DGEMM_USE_TENSOR_CORE
+  const double * const m_blockAddrA, * const m_blockAddrB;
+  const int m_firstIndex, m_lastIndex, m_lastInc;
+#else
   const unsigned m_startM, m_startN;
   const double * const m_firstAddrA, * const m_lastAddrA;
   const double * const m_firstAddrB, * const m_lastAddrB;
   const unsigned m_lastIncA, m_lastIncB;
+#endif
   __device__ static double shfl(double var, unsigned src_idx) noexcept {
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 9000
 #pragma message "use shfl_sync"
@@ -90,11 +100,43 @@ class Accumulator {
     return __shfl(var, src_idx);
 #endif
   }
+#ifdef DGEMM_USE_TENSOR_CORE
+  __device__ static void mmaM8N8K4(double &c1, double &c2,
+    double a, double b) noexcept {
+
+    double c3, c4;
+    asm("mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 "
+      "{%0,%1},{%2},{%3},{%4,%5};":"=d"(c3),"=d"(c4):"d"(a),"d"(b),"d"(c1),"d"(c2));
+    c1 = c3;
+    c2 = c4;
+  }
+  __noinline__
+  __device__ static short getFirstIndex(int tidx) noexcept {
+    int k = tidx & 3;
+    int m = tidx >> 2 << 2;
+    return 1 + m + k * 33;
+  }
+  __noinline__
+  __device__ static short getLastIndex(int tidx) noexcept {
+    int k = (tidx & 3) + 12;
+    int m = tidx >> 2 << 2;
+    if (k == 15 && m >= 16) return (m - 16) * 33;
+    return 1 + m + k * 33;
+  }
+  __noinline__
+  __device__ static short getLastInc(int tidx) noexcept {
+    int k = (tidx & 3) + 12;
+    int m = tidx >> 2 << 2;
+    if (k == 15 && m >= 16) return 33;
+    return 1;
+  }
+#else
   __noinline__
   __device__ static unsigned getLastIndex(unsigned start_m) noexcept {
     if (start_m >= 16) return (start_m - 16u) * 33u;
     return start_m + 496u;
   }
+#endif
 public:
   __device__ Accumulator(const double *first_addr_a,
     const double *first_addr_b) noexcept:
@@ -106,18 +148,60 @@ public:
     c50(0.0), c51(0.0), c52(0.0), c53(0.0),
     c60(0.0), c61(0.0), c62(0.0), c63(0.0),
     c70(0.0), c71(0.0), c72(0.0), c73(0.0),
+#ifdef DGEMM_USE_TENSOR_CORE
+    m_blockAddrA(first_addr_a), m_blockAddrB(first_addr_b),
+    m_firstIndex(getFirstIndex(threadIdx.x)),
+    m_lastIndex(getLastIndex(threadIdx.x)),
+    m_lastInc(getLastInc(threadIdx.x))
+#else
     m_startM(threadIdx.x % 4u * 8u), m_startN(threadIdx.x / 4u * 4u),
     m_firstAddrA(first_addr_a + m_startM + 1u),
     m_lastAddrA(first_addr_a + getLastIndex(m_startM)),
     m_firstAddrB(first_addr_b + m_startN + 1u),
     m_lastAddrB(first_addr_b + getLastIndex(m_startN)),
     m_lastIncA(m_startM >= 16 ? 33u : 1u),
-    m_lastIncB(m_startN >= 16 ? 33u : 1u) {
+    m_lastIncB(m_startN >= 16 ? 33u : 1u)
+#endif
+  {
 
     assert(warpSize == 32 && blockDim.x == 32);
   }
 
   __device__ void accK16() noexcept {
+#ifdef DGEMM_USE_TENSOR_CORE
+    auto acck4 = [&](double a0, double a1, double a2, double a3,
+      double b0, double b1, double b2, double b3)->void {
+
+      mmaM8N8K4(c00, c40, b0, a0);
+      mmaM8N8K4(c01, c41, b1, a0);
+      mmaM8N8K4(c02, c42, b2, a0);
+      mmaM8N8K4(c03, c43, b3, a0);
+      mmaM8N8K4(c10, c50, b0, a1);
+      mmaM8N8K4(c11, c51, b1, a1);
+      mmaM8N8K4(c12, c52, b2, a1);
+      mmaM8N8K4(c13, c53, b3, a1);
+      mmaM8N8K4(c20, c60, b0, a2);
+      mmaM8N8K4(c21, c61, b1, a2);
+      mmaM8N8K4(c22, c62, b2, a2);
+      mmaM8N8K4(c23, c63, b3, a2);
+      mmaM8N8K4(c30, c70, b0, a3);
+      mmaM8N8K4(c31, c71, b1, a3);
+      mmaM8N8K4(c32, c72, b2, a3);
+      mmaM8N8K4(c33, c73, b3, a3);
+    };
+    const double *ap = m_blockAddrA + m_firstIndex;
+    const double *bp = m_blockAddrB + m_firstIndex;
+#pragma unroll 1
+    for (int i = 0; i < 2; ++i) {
+      acck4(ap[0], ap[1], ap[2], ap[3], bp[0], bp[1], bp[2], bp[3]);
+      ap += 132u;
+      bp += 132u;
+    }
+    ap = m_blockAddrA + m_lastIndex;
+    bp = m_blockAddrB + m_lastIndex;
+    acck4(ap[0], ap[m_lastInc], ap[m_lastInc * 2], ap[m_lastInc * 3],
+      bp[0], bp[m_lastInc], bp[m_lastInc * 2], bp[m_lastInc * 3]);
+#else
     const double *ap = m_firstAddrA, *bp = m_firstAddrB;
     auto k1 = [&]()->void {
       const double b0 = bp[0], b1 = bp[1], b2 = bp[2], b3 = bp[3];
@@ -139,16 +223,8 @@ public:
       acc4(c70, c71, c72, c73, ap[7]);
       ap += 33u;
     };
-    auto k3 = [&]()->void {
-      k1();
-      k1();
-      k1();
-    };
-    k3();
-    k3();
-    k3();
-    k3();
-    k3();
+#pragma unroll 3
+    for (int i = 0; i < 15; ++i) k1();
     //last K
     const double b0 = m_lastAddrB[0];
     const double b1 = m_lastAddrB[m_lastIncB];
@@ -171,6 +247,7 @@ public:
     acc4(c50, c51, c52, c53);
     acc4(c60, c61, c62, c63);
     acc4(c70, c71, c72, c73);
+#endif
   }
 
   __device__ void storeC(double *c_m32n32, unsigned LDC,
