@@ -13,6 +13,7 @@ class MemTransferA {
   const std::ptrdiff_t m_globalMemStride;
 
   const char *m_globalMem;
+  unsigned m_commonTasks;
   unsigned m_tasks[MDiv32];
   double m_loaded[MDiv32];
 
@@ -36,7 +37,8 @@ public:
     m_globalMemStride(std::ptrdiff_t(a_rowmajor ? 128u : 128u * LDA) - m_m32Stride * 4),
     m_globalMem(reinterpret_cast<const char*>(A_m32
       + m_subK * (a_rowmajor ? 1u : LDA)
-      + m_subM * (a_rowmajor ? LDA : 1u))) {
+      + m_subM * (a_rowmajor ? LDA : 1u))),
+    m_commonTasks(-1) {
 
     assert(warpSize == 32 && blockDim.x == 32);
     assert(K <= (1LL << (4 + sizeof(unsigned) * CHAR_BIT)));
@@ -44,10 +46,22 @@ public:
       if (block_mlen <= 32u * i + m_subM) m_tasks[i] = 0;
       else if (m_subK >= K) m_tasks[i] = 0;
       else m_tasks[i] = (K - m_subK + 15u) >> 4;
+      if (m_tasks[i] < m_commonTasks) m_commonTasks = m_tasks[i];
     }
+    for (unsigned i = 0; i < MDiv32; ++i) m_tasks[i] -= m_commonTasks;
   }
 
   __device__ void load() noexcept {
+    if (m_commonTasks) {
+      m_commonTasks--;
+      #pragma unroll
+      for (unsigned i = 0; i < MDiv32; ++i) {
+        m_loaded[i] = __ldg(reinterpret_cast<const double*>(m_globalMem));
+        m_globalMem += m_m32Stride;
+      }
+      m_globalMem += m_globalMemStride;
+      return;
+    }
     #pragma unroll
     for (unsigned i = 0; i < MDiv32; ++i) {
       unsigned &tasks = m_tasks[i];
@@ -192,7 +206,7 @@ public:
     const double *ap = m_blockAddrA + m_firstIndex;
     const double *bp = m_blockAddrB + m_firstIndex;
 #pragma unroll 1
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < 3; ++i) {
       acck4(ap[0], ap[1], ap[2], ap[3], bp[0], bp[1], bp[2], bp[3]);
       ap += 132u;
       bp += 132u;
@@ -415,6 +429,7 @@ void dgemm_async(cudaStream_t &stream, const double *devA, const double *devB, d
 
   // matrix C is row_major
   cudaFuncSetSharedMemConfig(&impl::dgemm_kernel, cudaSharedMemBankSizeEightByte);
+    
   const dim3 grid_size(1, (N + 127u) / 128u, (M + 127u) / 128u);
   const dim3 block_size(32, 4, 4);
 
