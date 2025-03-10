@@ -3,8 +3,17 @@
 
 namespace cuda_thread {
 
+//shared memory pattern inspired from the description of WGMMA in NVIDIA PTX manual 8.7
+class ShmLayout {
+protected:
+  __device__ constexpr
+  static unsigned getSharedIdx(unsigned subm, unsigned subk) noexcept {
+    return (subk << 5) | (subm ^ subk);
+  }
+};
+
 template <unsigned MDiv32>
-class MemTransferA {
+class MemTransferA: protected ShmLayout {
   //can also be used for matrix B: A_m32=>B_n32, subM_end=>subN_end, LDA=>LDB, a_rowmajor=>b_colmajor
   //m_subM, m_subK, m_sharedMem only for first M32
   const unsigned m_subM, m_subK;
@@ -17,11 +26,6 @@ class MemTransferA {
   unsigned m_tasks[MDiv32];
   double m_loaded[MDiv32];
 
-  __noinline__
-  __device__ static unsigned getSharedIdx(unsigned subm, unsigned subk) noexcept {
-    if (subm < 16u || subk < 15u) return subm + 1u + subk * 33u;
-    return (subm - 16u) * 33u;
-  }
 public:
   //task_id: [0,16)
   //shared_block: double[16][32] (a block of shared memory, holding m32k16 submat)
@@ -88,7 +92,7 @@ public:
 #define DGEMM_USE_TENSOR_CORE
 #endif
 
-class Accumulator {
+class Accumulator: protected ShmLayout {
   double c00, c01, c02, c03;
   double c10, c11, c12, c13;
   double c20, c21, c22, c23;
@@ -97,14 +101,11 @@ class Accumulator {
   double c50, c51, c52, c53;
   double c60, c61, c62, c63;
   double c70, c71, c72, c73;
-#ifdef DGEMM_USE_TENSOR_CORE
   const double * const m_blockAddrA, * const m_blockAddrB;
-  const int m_firstIndex, m_lastIndex, m_lastInc;
+#ifdef DGEMM_USE_TENSOR_CORE
+  const short m_firstIndex;
 #else
-  const unsigned m_startM, m_startN;
-  const double * const m_firstAddrA, * const m_lastAddrA;
-  const double * const m_firstAddrB, * const m_lastAddrB;
-  const unsigned m_lastIncA, m_lastIncB;
+  const short m_startM1, m_startM2, m_startN;
 #endif
   __device__ static double shfl(double var, unsigned src_idx) noexcept {
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 9000
@@ -118,37 +119,14 @@ class Accumulator {
   __device__ static void mmaM8N8K4(double &c1, double &c2,
     double a, double b) noexcept {
 
-    double c3, c4;
     asm("mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 "
-      "{%0,%1},{%2},{%3},{%4,%5};":"=d"(c3),"=d"(c4):"d"(a),"d"(b),"d"(c1),"d"(c2));
-    c1 = c3;
-    c2 = c4;
+      "{%0,%1},{%2},{%3},{%0,%1};":"+d"(c1),"+d"(c2):"d"(a),"d"(b),"d"(c1),"d"(c2));
   }
   __noinline__
   __device__ static short getFirstIndex(int tidx) noexcept {
-    int k = tidx & 3;
+    int k = (tidx & 3) << 2;
     int m = tidx >> 2 << 2;
-    return 1 + m + k * 33;
-  }
-  __noinline__
-  __device__ static short getLastIndex(int tidx) noexcept {
-    int k = (tidx & 3) + 12;
-    int m = tidx >> 2 << 2;
-    if (k == 15 && m >= 16) return (m - 16) * 33;
-    return 1 + m + k * 33;
-  }
-  __noinline__
-  __device__ static short getLastInc(int tidx) noexcept {
-    int k = (tidx & 3) + 12;
-    int m = tidx >> 2 << 2;
-    if (k == 15 && m >= 16) return 33;
-    return 1;
-  }
-#else
-  __noinline__
-  __device__ static unsigned getLastIndex(unsigned start_m) noexcept {
-    if (start_m >= 16) return (start_m - 16u) * 33u;
-    return start_m + 496u;
+    return getSharedIdx(m, k);
   }
 #endif
 public:
@@ -162,19 +140,12 @@ public:
     c50(0.0), c51(0.0), c52(0.0), c53(0.0),
     c60(0.0), c61(0.0), c62(0.0), c63(0.0),
     c70(0.0), c71(0.0), c72(0.0), c73(0.0),
-#ifdef DGEMM_USE_TENSOR_CORE
     m_blockAddrA(first_addr_a), m_blockAddrB(first_addr_b),
-    m_firstIndex(getFirstIndex(threadIdx.x)),
-    m_lastIndex(getLastIndex(threadIdx.x)),
-    m_lastInc(getLastInc(threadIdx.x))
+#ifdef DGEMM_USE_TENSOR_CORE
+    m_firstIndex(getFirstIndex(threadIdx.x))
 #else
-    m_startM(threadIdx.x % 4u * 8u), m_startN(threadIdx.x / 4u * 4u),
-    m_firstAddrA(first_addr_a + m_startM + 1u),
-    m_lastAddrA(first_addr_a + getLastIndex(m_startM)),
-    m_firstAddrB(first_addr_b + m_startN + 1u),
-    m_lastAddrB(first_addr_b + getLastIndex(m_startN)),
-    m_lastIncA(m_startM >= 16 ? 33u : 1u),
-    m_lastIncB(m_startN >= 16 ? 33u : 1u)
+    m_startM1(threadIdx.x % 4u * 8u), m_startM2(m_startM1 + 4u),
+    m_startN(threadIdx.x / 4u * 4u)
 #endif
   {
 
@@ -205,21 +176,17 @@ public:
     };
     const double *ap = m_blockAddrA + m_firstIndex;
     const double *bp = m_blockAddrB + m_firstIndex;
-#pragma unroll 1
-    for (int i = 0; i < 3; ++i) {
-      acck4(ap[0], ap[1], ap[2], ap[3], bp[0], bp[1], bp[2], bp[3]);
-      ap += 132u;
-      bp += 132u;
+    #pragma unroll
+    for (unsigned k = 0; k < 4; ++k) {
+      acck4(ap[getSharedIdx(0, k)], ap[getSharedIdx(1, k)], ap[getSharedIdx(2, k)],
+        ap[getSharedIdx(3, k)], bp[getSharedIdx(0, k)], bp[getSharedIdx(1, k)],
+        bp[getSharedIdx(2, k)], bp[getSharedIdx(3, k)]);
     }
-    ap = m_blockAddrA + m_lastIndex;
-    bp = m_blockAddrB + m_lastIndex;
-    acck4(ap[0], ap[m_lastInc], ap[m_lastInc * 2], ap[m_lastInc * 3],
-      bp[0], bp[m_lastInc], bp[m_lastInc * 2], bp[m_lastInc * 3]);
 #else
-    const double *ap = m_firstAddrA, *bp = m_firstAddrB;
-    auto k1 = [&]()->void {
-      const double b0 = bp[0], b1 = bp[1], b2 = bp[2], b3 = bp[3];
-      bp += 33u;
+    auto acck1 = [&](double a0, double a1, double a2, double a3,
+      double a4, double a5, double a6, double a7,
+      double b0, double b1, double b2, double b3)->void {
+
       auto acc4 = [&](double &c1, double &c2,
         double &c3, double &c4, double a)->void {
         c1 += a * b0;
@@ -227,40 +194,32 @@ public:
         c3 += a * b2;
         c4 += a * b3;
       };
-      acc4(c00, c01, c02, c03, ap[0]);
-      acc4(c10, c11, c12, c13, ap[1]);
-      acc4(c20, c21, c22, c23, ap[2]);
-      acc4(c30, c31, c32, c33, ap[3]);
-      acc4(c40, c41, c42, c43, ap[4]);
-      acc4(c50, c51, c52, c53, ap[5]);
-      acc4(c60, c61, c62, c63, ap[6]);
-      acc4(c70, c71, c72, c73, ap[7]);
-      ap += 33u;
+      acc4(c00, c01, c02, c03, a0);
+      acc4(c10, c11, c12, c13, a1);
+      acc4(c20, c21, c22, c23, a2);
+      acc4(c30, c31, c32, c33, a3);
+      acc4(c40, c41, c42, c43, a4);
+      acc4(c50, c51, c52, c53, a5);
+      acc4(c60, c61, c62, c63, a6);
+      acc4(c70, c71, c72, c73, a7);
     };
-#pragma unroll 3
-    for (int i = 0; i < 15; ++i) k1();
-    //last K
-    const double b0 = m_lastAddrB[0];
-    const double b1 = m_lastAddrB[m_lastIncB];
-    const double b2 = m_lastAddrB[m_lastIncB * 2u];
-    const double b3 = m_lastAddrB[m_lastIncB * 3u];
-    ap = m_lastAddrA;
-    auto acc4 = [&](double &c1, double &c2, double &c3, double &c4)->void {
-      const double a = *ap;
-      c1 += a * b0;
-      c2 += a * b1;
-      c3 += a * b2;
-      c4 += a * b3;
-      ap += m_lastIncA;
+    auto acck4 = [&](unsigned short kstart)->void {
+      const double *ap1 = m_blockAddrA + getSharedIdx(m_startM1, kstart);
+      const double *ap2 = m_blockAddrA + getSharedIdx(m_startM2, kstart);
+      const double *bp = m_blockAddrB + getSharedIdx(m_startN, kstart);
+
+      #pragma unroll
+      for (unsigned k = 0; k < 4; ++k) {
+        acck1(ap1[getSharedIdx(0, k)], ap1[getSharedIdx(1, k)],
+          ap1[getSharedIdx(2, k)], ap1[getSharedIdx(3, k)],
+          ap2[getSharedIdx(0, k)], ap2[getSharedIdx(1, k)], 
+          ap2[getSharedIdx(2, k)], ap2[getSharedIdx(3, k)],
+          bp[getSharedIdx(0, k)], bp[getSharedIdx(1, k)],
+          bp[getSharedIdx(2, k)], bp[getSharedIdx(3, k)]);
+      }
     };
-    acc4(c00, c01, c02, c03);
-    acc4(c10, c11, c12, c13);
-    acc4(c20, c21, c22, c23);
-    acc4(c30, c31, c32, c33);
-    acc4(c40, c41, c42, c43);
-    acc4(c50, c51, c52, c53);
-    acc4(c60, c61, c62, c63);
-    acc4(c70, c71, c72, c73);
+    #pragma unroll 
+    for (unsigned short k = 0; k < 16; k += 4) acck4(k);
 #endif
   }
 
