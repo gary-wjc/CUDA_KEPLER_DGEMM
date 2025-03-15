@@ -396,7 +396,7 @@ void dgemm_async(cudaStream_t &stream, const double *devA, const double *devB, d
   // matrix C is row_major
   cudaFuncSetSharedMemConfig(&impl::dgemm_kernel, cudaSharedMemBankSizeEightByte);
     
-  const dim3 grid_size((N + 127u) / 128u * (M + 127u) / 128u, 1, 1);
+  const dim3 grid_size((N + 127u) / 128u * ((M + 127u) / 128u), 1, 1);
   const dim3 block_size(32, 4, 4);
 
   impl::dgemm_kernel<<<grid_size, block_size, 0, stream>>>(
