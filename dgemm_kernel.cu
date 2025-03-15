@@ -17,7 +17,7 @@ class MemTransferA: protected ShmLayout {
   //can also be used for matrix B: A_m32=>B_n32, subM_end=>subN_end, LDA=>LDB, a_rowmajor=>b_colmajor
   //m_subM, m_subK, m_sharedMem only for first M32
   const unsigned m_subM, m_subK;
-  double * const m_sharedMem;
+  const unsigned m_sharedMemOff;
   const std::ptrdiff_t m_m32Stride;
   const std::ptrdiff_t m_globalMemStride;
 
@@ -31,14 +31,15 @@ public:
   //shared_block: double[16][32] (a block of shared memory, holding m32k16 submat)
   //each warp manipulate 1/16 of shared_block, that is 32 double numbers
   //each warp is assigned a task_id
-  __device__ MemTransferA(const double *A_m32, double *shared_block,
+  __device__ MemTransferA(const double *A_m32,
     unsigned task_id, unsigned block_mlen, std::size_t K,
     std::size_t LDA, bool a_rowmajor) noexcept:
     m_subM(a_rowmajor ? (task_id + (threadIdx.x >> 4 << 4)) : threadIdx.x),
     m_subK(a_rowmajor ? (threadIdx.x % 16) : task_id),
-    m_sharedMem(shared_block + getSharedIdx(m_subM, m_subK)),
+    m_sharedMemOff(getSharedIdx(m_subM, m_subK)),
     m_m32Stride(a_rowmajor ? 256u * LDA : 256u),
-    m_globalMemStride(std::ptrdiff_t(a_rowmajor ? 128u : 128u * LDA) - m_m32Stride * 4),
+    m_globalMemStride(std::ptrdiff_t(a_rowmajor ? 128u : 128u * LDA)
+      - m_m32Stride * MDiv32),
     m_globalMem(reinterpret_cast<const char*>(A_m32
       + m_subK * (a_rowmajor ? 1u : LDA)
       + m_subM * (a_rowmajor ? LDA : 1u))),
@@ -79,10 +80,11 @@ public:
     m_globalMem += m_globalMemStride;
   }
 
-  __device__ void store() const noexcept {
+  __device__ void store(double *shared_mem) const noexcept {
+    shared_mem += m_sharedMemOff;
     #pragma unroll
     for (unsigned i = 0; i < MDiv32; ++i) {
-      m_sharedMem[i * 512u] = m_loaded[i];
+      shared_mem[i * 512u] = m_loaded[i];
     }
   }
 }; // class MemTransferA
@@ -333,8 +335,13 @@ __global__ void dgemm_kernel(const double *devA, const double *devB, double *dev
   std::size_t LDA, std::size_t LDB, std::size_t LDC) {
 
   assert(blockDim.y == 4 && blockDim.z == 4);
-  const std::size_t block_m_base = blockIdx.z * 128u;
-  const std::size_t block_n_base = blockIdx.y * 128u;
+  const std::size_t nblks = (N+127u) >> 7;
+  const std::size_t mblkid = blockIdx.x / nblks;
+  const std::size_t nblkid_off = blockIdx.x % nblks;
+  const std::size_t nblkid = mblkid & 1u ?
+    (nblks - 1u - nblkid_off) : nblkid_off;
+  const std::size_t block_m_base = mblkid * 128u;
+  const std::size_t block_n_base = nblkid * 128u;
   if (block_m_base >= M || block_n_base >= N) return;
   const std::size_t a_m_inc = a_rowmajor ? LDA : 1;
   const std::size_t b_n_inc = b_rowmajor ? 1 : LDB;
@@ -349,9 +356,9 @@ __global__ void dgemm_kernel(const double *devA, const double *devB, double *dev
     return M - m_base;
   };
   const unsigned copy_taskid = threadIdx.z * blockDim.y + threadIdx.y;
-  cuda_thread::MemTransferA<4> mta1(block_a_base, shared_blockA,
+  cuda_thread::MemTransferA<4> mta1(block_a_base,
     copy_taskid, M - block_m_base, K, LDA, a_rowmajor);
-  cuda_thread::MemTransferA<4> mtb1(block_b_base, shared_blockB,
+  cuda_thread::MemTransferA<4> mtb1(block_b_base,
     copy_taskid, N - block_n_base, K, LDB, !b_rowmajor);
 
   const unsigned calc_m_block_id = threadIdx.z;
@@ -369,8 +376,8 @@ __global__ void dgemm_kernel(const double *devA, const double *devB, double *dev
     mta1.load();
     mtb1.load();
     __syncthreads();
-    mta1.store();
-    mtb1.store();
+    mta1.store(shared_blockA);
+    mtb1.store(shared_blockB);
     __syncthreads();
     if (calc_valid) acc_m8n4.accK16();
   }
@@ -389,7 +396,7 @@ void dgemm_async(cudaStream_t &stream, const double *devA, const double *devB, d
   // matrix C is row_major
   cudaFuncSetSharedMemConfig(&impl::dgemm_kernel, cudaSharedMemBankSizeEightByte);
     
-  const dim3 grid_size(1, (N + 127u) / 128u, (M + 127u) / 128u);
+  const dim3 grid_size((N + 127u) / 128u * (M + 127u) / 128u, 1, 1);
   const dim3 block_size(32, 4, 4);
 
   impl::dgemm_kernel<<<grid_size, block_size, 0, stream>>>(
