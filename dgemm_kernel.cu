@@ -42,18 +42,23 @@ public:
       - m_m32Stride * MDiv32),
     m_globalMem(reinterpret_cast<const char*>(A_m32
       + m_subK * (a_rowmajor ? 1u : LDA)
-      + m_subM * (a_rowmajor ? LDA : 1u))),
-    m_commonTasks(-1) {
+      + m_subM * (a_rowmajor ? LDA : 1u))) {
 
     assert(warpSize == 32 && blockDim.x == 32);
     assert(K <= (1LL << (4 + sizeof(unsigned) * CHAR_BIT)));
+    unsigned max_m = (a_rowmajor ? (task_id + 16) : 31) + (MDiv32 - 1u) * 32u;
+    if (max_m >= block_mlen) m_commonTasks = 0;
+    else {
+      unsigned max_k = a_rowmajor ? 15 : task_id;
+      if (max_k >= K) m_commonTasks = 0;
+      else m_commonTasks = (K - max_k + 15u) >> 4;
+    }
     for (unsigned i = 0; i < MDiv32; ++i) {
       if (block_mlen <= 32u * i + m_subM) m_tasks[i] = 0;
       else if (m_subK >= K) m_tasks[i] = 0;
       else m_tasks[i] = (K - m_subK + 15u) >> 4;
-      if (m_tasks[i] < m_commonTasks) m_commonTasks = m_tasks[i];
+      m_tasks[i] -= m_commonTasks;
     }
-    for (unsigned i = 0; i < MDiv32; ++i) m_tasks[i] -= m_commonTasks;
   }
 
   __device__ void load() noexcept {
@@ -103,7 +108,6 @@ class Accumulator: protected ShmLayout {
   double c50, c51, c52, c53;
   double c60, c61, c62, c63;
   double c70, c71, c72, c73;
-  const double * const m_blockAddrA, * const m_blockAddrB;
 #ifdef DGEMM_USE_TENSOR_CORE
   const short m_firstIndex;
 #else
@@ -132,8 +136,7 @@ class Accumulator: protected ShmLayout {
   }
 #endif
 public:
-  __device__ Accumulator(const double *first_addr_a,
-    const double *first_addr_b) noexcept:
+  __device__ Accumulator() noexcept:
     c00(0.0), c01(0.0), c02(0.0), c03(0.0),
     c10(0.0), c11(0.0), c12(0.0), c13(0.0),
     c20(0.0), c21(0.0), c22(0.0), c23(0.0),
@@ -142,7 +145,6 @@ public:
     c50(0.0), c51(0.0), c52(0.0), c53(0.0),
     c60(0.0), c61(0.0), c62(0.0), c63(0.0),
     c70(0.0), c71(0.0), c72(0.0), c73(0.0),
-    m_blockAddrA(first_addr_a), m_blockAddrB(first_addr_b),
 #ifdef DGEMM_USE_TENSOR_CORE
     m_firstIndex(getFirstIndex(threadIdx.x))
 #else
@@ -154,7 +156,7 @@ public:
     assert(warpSize == 32 && blockDim.x == 32);
   }
 
-  __device__ void accK16() noexcept {
+  __device__ void accK16(const double *shared_blk_a, const double *shared_blk_b) noexcept {
 #ifdef DGEMM_USE_TENSOR_CORE
     auto acck4 = [&](double a0, double a1, double a2, double a3,
       double b0, double b1, double b2, double b3)->void {
@@ -176,8 +178,8 @@ public:
       mmaM8N8K4(c32, c72, b2, a3);
       mmaM8N8K4(c33, c73, b3, a3);
     };
-    const double *ap = m_blockAddrA + m_firstIndex;
-    const double *bp = m_blockAddrB + m_firstIndex;
+    const double *ap = shared_blk_a + m_firstIndex;
+    const double *bp = shared_blk_b + m_firstIndex;
     #pragma unroll
     for (unsigned k = 0; k < 4; ++k) {
       acck4(ap[getSharedIdx(0, k)], ap[getSharedIdx(1, k)], ap[getSharedIdx(2, k)],
@@ -206,9 +208,9 @@ public:
       acc4(c70, c71, c72, c73, a7);
     };
     auto acck4 = [&](unsigned short kstart)->void {
-      const double *ap1 = m_blockAddrA + getSharedIdx(m_startM1, kstart);
-      const double *ap2 = m_blockAddrA + getSharedIdx(m_startM2, kstart);
-      const double *bp = m_blockAddrB + getSharedIdx(m_startN, kstart);
+      const double *ap1 = shared_blk_a + getSharedIdx(m_startM1, kstart);
+      const double *ap2 = shared_blk_a + getSharedIdx(m_startM2, kstart);
+      const double *bp = shared_blk_b + getSharedIdx(m_startN, kstart);
 
       #pragma unroll
       for (unsigned k = 0; k < 4; ++k) {
@@ -369,8 +371,9 @@ __global__ void dgemm_kernel(const double *devA, const double *devB, double *dev
   const unsigned warp_calc_n = get_subm_end(N, warp_calc_n_base);
   double * const warp_submat_c = devC + warp_calc_n_base + warp_calc_m_base * LDC;
   const bool calc_valid = warp_calc_m && warp_calc_n;
-  cuda_thread::Accumulator acc_m8n4(shared_blockA + calc_m_block_id * 512u,
-    shared_blockB + calc_n_block_id * 512u);
+  cuda_thread::Accumulator acc_m8n4;
+  const unsigned shoffblka = calc_m_block_id * 512u;
+  const unsigned shoffblkb = calc_n_block_id * 512u;
 
   for (std::ptrdiff_t kleft = K; kleft > 0; kleft -= 16) {
     mta1.load();
@@ -379,7 +382,9 @@ __global__ void dgemm_kernel(const double *devA, const double *devB, double *dev
     mta1.store(shared_blockA);
     mtb1.store(shared_blockB);
     __syncthreads();
-    if (calc_valid) acc_m8n4.accK16();
+    if (calc_valid) {
+      acc_m8n4.accK16(shared_blockA + shoffblka, shared_blockB + shoffblkb);
+    }
   }
 
   if (calc_valid) {
