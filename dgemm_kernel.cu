@@ -109,7 +109,7 @@ class Accumulator: protected ShmLayout {
   double c60, c61, c62, c63;
   double c70, c71, c72, c73;
 #ifdef DGEMM_USE_TENSOR_CORE
-  const short m_firstIndex;
+  const short m_startM, m_startK;
 #else
   const short m_startM1, m_startM2, m_startN;
 #endif
@@ -128,12 +128,6 @@ class Accumulator: protected ShmLayout {
     asm("mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 "
       "{%0,%1},{%2},{%3},{%0,%1};":"+d"(c1),"+d"(c2):"d"(a),"d"(b),"d"(c1),"d"(c2));
   }
-  __noinline__
-  __device__ static short getFirstIndex(int tidx) noexcept {
-    int k = (tidx & 3) << 2;
-    int m = tidx >> 2 << 2;
-    return getSharedIdx(m, k);
-  }
 #endif
 public:
   __device__ Accumulator() noexcept:
@@ -146,7 +140,8 @@ public:
     c60(0.0), c61(0.0), c62(0.0), c63(0.0),
     c70(0.0), c71(0.0), c72(0.0), c73(0.0),
 #ifdef DGEMM_USE_TENSOR_CORE
-    m_firstIndex(getFirstIndex(threadIdx.x))
+    m_startM(threadIdx.x & 0xFC), //m_startN equal to m_startM
+    m_startK(((threadIdx.x & 1) << 1) | ((threadIdx.x & 2) << 2))
 #else
     m_startM1(threadIdx.x % 4u * 8u), m_startM2(m_startM1 + 4u),
     m_startN(threadIdx.x / 4u * 4u)
@@ -178,14 +173,21 @@ public:
       mmaM8N8K4(c32, c72, b2, a3);
       mmaM8N8K4(c33, c73, b3, a3);
     };
-    const double *ap = shared_blk_a + m_firstIndex;
-    const double *bp = shared_blk_b + m_firstIndex;
-    #pragma unroll
-    for (unsigned k = 0; k < 4; ++k) {
-      acck4(ap[getSharedIdx(0, k)], ap[getSharedIdx(1, k)], ap[getSharedIdx(2, k)],
-        ap[getSharedIdx(3, k)], bp[getSharedIdx(0, k)], bp[getSharedIdx(1, k)],
-        bp[getSharedIdx(2, k)], bp[getSharedIdx(3, k)]);
-    }
+    auto acck8 = [&](unsigned start_m /* equal to start_n */,
+      unsigned start_k) -> void {
+
+      unsigned init_idx = getSharedIdx(start_m, start_k);
+      const double *ap = shared_blk_a + init_idx;
+      const double *bp = shared_blk_b + init_idx;
+      #pragma unroll
+      for (unsigned k = 0; k < 2; ++k) {
+        acck4(ap[getSharedIdx(0, k)], ap[getSharedIdx(1, k)], ap[getSharedIdx(2, k)],
+          ap[getSharedIdx(3, k)], bp[getSharedIdx(0, k)], bp[getSharedIdx(1, k)],
+          bp[getSharedIdx(2, k)], bp[getSharedIdx(3, k)]);
+      }
+    };
+    #pragma unroll 1
+    for (unsigned koff = 0; koff < 8; koff += 4) acck8(m_startM, m_startK + koff);
 #else
     auto acck1 = [&](double a0, double a1, double a2, double a3,
       double a4, double a5, double a6, double a7,
