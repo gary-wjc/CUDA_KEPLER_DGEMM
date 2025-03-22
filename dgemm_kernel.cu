@@ -176,14 +176,17 @@ public:
     auto acck8 = [&](unsigned start_m /* equal to start_n */,
       unsigned start_k) -> void {
 
-      unsigned init_idx = getSharedIdx(start_m, start_k);
-      const double *ap = shared_blk_a + init_idx;
-      const double *bp = shared_blk_b + init_idx;
+      unsigned init_idx_m01 = getSharedIdx(start_m, start_k);
+      unsigned init_idx_m23 = getSharedIdx(start_m+2, start_k);
+      const double *apm01 = shared_blk_a + init_idx_m01;
+      const double *bpn01 = shared_blk_b + init_idx_m01;
+      const double *apm23 = shared_blk_a + init_idx_m23;
+      const double *bpn23 = shared_blk_b + init_idx_m23;
       #pragma unroll
       for (unsigned k = 0; k < 2; ++k) {
-        acck4(ap[getSharedIdx(0, k)], ap[getSharedIdx(1, k)], ap[getSharedIdx(2, k)],
-          ap[getSharedIdx(3, k)], bp[getSharedIdx(0, k)], bp[getSharedIdx(1, k)],
-          bp[getSharedIdx(2, k)], bp[getSharedIdx(3, k)]);
+        acck4(apm01[getSharedIdx(0, k)], apm01[getSharedIdx(1, k)], apm23[getSharedIdx(0, k)],
+          apm23[getSharedIdx(1, k)], bpn01[getSharedIdx(0, k)], bpn01[getSharedIdx(1, k)],
+          bpn23[getSharedIdx(0, k)], bpn23[getSharedIdx(1, k)]);
       }
     };
     #pragma unroll 1
