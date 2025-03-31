@@ -95,8 +95,9 @@ class WarpAccM32N32 {
 public:
   __device__ WarpAccM32N32(
     unsigned mstart_warp_in_ctb, unsigned nstart_warp_in_ctb): m_acc{},
-    m_firstAoff(getSharedStartOff(((threadIdx.x & 3) << 3) + mstart_warp_in_ctb)),
-    m_firstBoff(getSharedStartOff((threadIdx.x & 0xFFFC) + nstart_warp_in_ctb)) {
+    m_firstAoff(getSharedStartOff(((threadIdx.x & 0xC) << 1) + mstart_warp_in_ctb)),
+    m_firstBoff(getSharedStartOff((((threadIdx.x & 3) << 2) | (threadIdx.x & 16))
+      + nstart_warp_in_ctb)) {
 
     assert(blockDim.x == 32);
   }
@@ -135,16 +136,15 @@ public:
   __device__ void store(double *C, std::size_t M, std::size_t N,
     std::size_t LDC, std::size_t mstart_warp, std::size_t nstart_warp) {
 
-    const unsigned baseidx = threadIdx.x & 0xFFFC;
     #pragma unroll
     for (unsigned n = 1; n < 4; ++n) {
-      unsigned shfidx = baseidx + ((threadIdx.x + n) & 3);
+      unsigned shfidx = (threadIdx.x & 16) | ((threadIdx.x + n * 4) & 0xF);
       #pragma unroll
       for (unsigned m = 0; m < 8; ++m) {
         m_acc[n][m] = __shfl_sync(0xFFFFFFFF, m_acc[n][m], shfidx);
       }
     }
-    if (threadIdx.x & 2) {
+    if (threadIdx.x & 8) {
       #pragma unroll
       for (unsigned m = 0; m < 8; ++m) {
         double t1 = m_acc[0][m];
@@ -155,7 +155,7 @@ public:
         m_acc[3][m] = t2;
       }
     }
-    if (threadIdx.x & 1) {
+    if (threadIdx.x & 4) {
       #pragma unroll
       for (unsigned m = 0; m < 8; ++m) {
         double t1 = m_acc[0][m];
@@ -171,9 +171,10 @@ public:
       if (mstart_warp + 32u < M) mleft = 32;
       else mleft = M - mstart_warp;
     }
+    const unsigned baseidx = ((threadIdx.x & 3) << 2) | (threadIdx.x & 16);
     #pragma unroll
     for (unsigned n = 0; n < 4; ++n) {
-      unsigned npos = baseidx + ((32 + n - threadIdx.x) & 3);
+      unsigned npos = baseidx + ((8 + n - (threadIdx.x >> 2)) & 3);
       if (npos + nstart_warp < N) {
         #pragma unroll
         for (unsigned m = 0; m < 8; ++m) {
@@ -238,7 +239,7 @@ void dgemm_async(cudaStream_t &stream,
   const double *devA, const double *devB, double *devC,
   std::size_t M, std::size_t N, std::size_t K, bool a_rowmajor, bool b_rowmajor,
   std::size_t LDA, std::size_t LDB, std::size_t LDC) noexcept {
-    
+
   const dim3 grid_size((N + 127u) / 128u * ((M + 127u) / 128u), 1, 1);
   const dim3 block_size(32, 4, 4);
 
