@@ -1,3 +1,8 @@
+//nvcc -arch=sm_xx --shared -DNDEBUG --compiler-options -fPIC,-O3 -Xcicc -O3 -keep -Xptxas -v uuu.cu -o libdgemm_kernel.so
+#if __CUDA_ARCH__ >= 800
+#define DGEMM_SM80
+#endif
+
 #include <cassert>
 #include <cstddef>
 
@@ -48,6 +53,30 @@ public:
     m_mnTasks = mn_tasks > 8 ? 8u : mn_tasks;
     m_kTasks = get_tasks(koff, K);
   }
+#ifdef DGEMM_SM80
+#pragma message "enable cp.async"
+  __device__ void issue_transfer(double2 *shared) {
+    unsigned tbytes = 0;
+    if (m_kTasks) {
+      tbytes = 8;
+      m_kTasks--;
+    }
+    auto gptr = m_gPtr;
+    asm ("cvta.to.global.u64 %0,%0;":"+l"(gptr));
+    unsigned baseoff = (threadIdx.z * blockDim.y + threadIdx.y & 8) << 8;
+    double *begin = (&shared[0].x) + baseoff + m_sharedFirstPos;
+    asm ("cvta.to.shared.u64 %0,%0;":"+l"(begin));
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      if (j >= m_mnTasks) tbytes = 0;
+      asm volatile ("cp.async.ca.shared.global [%0],[%1],8,%2;"
+        ::"l"(begin),"l"(gptr),"r"(tbytes));
+      gptr += m_mnStrideBytes;
+      begin += 256;
+    }
+    m_gPtr += m_kStrideBytes;
+  }
+#endif
   __device__ void load(double (&recv)[8]) {
     if (m_kTasks) {
       m_kTasks--;
@@ -60,6 +89,7 @@ public:
       }
       m_gPtr += m_kStrideBytes;
     } else {
+#pragma unroll
       for (int j = 0; j < 8; ++j) {
         if (j >= m_mnTasks) break;
         recv[j] = 0;
@@ -88,6 +118,53 @@ public:
     std::size_t mpos_start = block_m_base + (threadIdx.z << 5);
     m_calcValid = npos_start < N && mpos_start < M;
   }
+#ifdef DGEMM_SM80
+  __device__ void acc_k16(const double2 *shared) {
+    if (!m_calcValid) return;
+#pragma message "use tensor core"
+    unsigned mnstartdiv2 = threadIdx.x >> 2;
+    unsigned kstartdiv2 = (threadIdx.x & 3) << 1;
+    unsigned offins32 = mnstartdiv2 + 1 + kstartdiv2 * 17u;
+    const double2 *abase = &shared[threadIdx.z * 256u];
+    const double2 *bbase = &shared[(threadIdx.y+4) * 256u];
+    const double2 *astart = &abase[offins32];
+    const double2 *bstart = &bbase[offins32];
+    auto acc_k4 = [&]()->void {
+      double2 a[2] = { *astart, astart[128] };
+      double2 b[2] = { *bstart, bstart[128] };
+#pragma unroll
+      for (short nseg = 0; nseg < 2; ++nseg) {
+        const double2 &bv = b[nseg];
+#pragma unroll
+        for (short mseg = 0; mseg < 2; ++mseg) {
+          const double2 &av = a[nseg];
+          asm (
+            "mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 {%0,%1},{%8},{%10},{%0,%1};"
+            "mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 {%2,%3},{%8},{%11},{%2,%3};"
+            "mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 {%4,%5},{%9},{%10},{%4,%5};"
+            "mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 {%6,%7},{%9},{%11},{%6,%7};"
+           :"+d"(m_acc[nseg][mseg][0][0].x),"+d"(m_acc[nseg][mseg][0][1].x),
+            "+d"(m_acc[nseg][mseg][0][0].y),"+d"(m_acc[nseg][mseg][0][1].y),
+            "+d"(m_acc[nseg][mseg][1][0].x),"+d"(m_acc[nseg][mseg][1][1].x),
+            "+d"(m_acc[nseg][mseg][1][0].y),"+d"(m_acc[nseg][mseg][1][1].y)
+           :"d"(bv.x),"d"(bv.y),"d"(av.x),"d"(av.y));
+        }
+      }
+    };
+    acc_k4();
+    astart += 8u;
+    bstart += 8u;
+    acc_k4();
+    astart += 9u;
+    bstart += 9u;
+    acc_k4();
+    if (kstartdiv2 == 6) offins32 = mnstartdiv2 * 17u;
+    else offins32 = mnstartdiv2 + 1 + kstartdiv2 * 17u + 25u;
+    astart = &abase[offins32];
+    bstart = &bbase[offins32];
+    acc_k4();
+  }
+#else
   __device__ void acc_k16(const double2 (&shared)[2048]) {
     if (!m_calcValid) return;
     unsigned mstartdiv2 = (threadIdx.x & 3) << 1;
@@ -139,7 +216,7 @@ public:
     bstart = &shared[(threadIdx.y+4) * 256u + nstartdiv2 * 17];
     acc_k1(17);
   }
-
+#endif
   __device__ void store(double *C, std::size_t M, std::size_t N, std::size_t LDC,
     std::size_t block_m_base, std::size_t block_n_base) {
 
@@ -193,21 +270,37 @@ __launch_bounds__(512, 1) __global__ void dgemm_kernel(
   std::size_t LDA, std::size_t LDB, std::size_t LDC) {
 
   assert(blockDim.y == 4 && blockDim.z == 4);
-  const std::size_t nblks = (N+127u) >> 7;
-  const std::size_t mblkid = blockIdx.x / nblks;
-  const std::size_t nblkid_off = blockIdx.x % nblks;
-  const std::size_t nblkid = mblkid & 1u ?
-    (nblks - 1u - nblkid_off) : nblkid_off;
-  const std::size_t block_m_base = mblkid * 128u;
-  const std::size_t block_n_base = nblkid * 128u;
+  unsigned nblkid = blockIdx.y;
+  unsigned mblkid = blockIdx.z;
+  const unsigned nblks = (N+127u) >> 7;
+  const unsigned mblks = (M+127u) >> 7;
+  if (nblkid < (nblks & unsigned(-4)) &&
+    mblkid < (mblks & unsigned(-4))) {
+    //perform transposed mapping of (4, nblks&-4) to increase L2-cache hit rate
+    unsigned new_mblkid = (mblkid & unsigned(-4)) | (nblkid & 3u);
+    nblkid = (nblkid >> 2) + (nblks >> 2) * (mblkid & 3u);
+    mblkid = new_mblkid;
+  }
+  const std::size_t block_m_base = std::size_t(mblkid) << 7;
+  const std::size_t block_n_base = std::size_t(nblkid) << 7;
   if (block_m_base >= M || block_n_base >= N) return;
-
-  __shared__ double2 shared[2048];
-  double gload[8];
   MemTransfer mtr(A, B, M, N, K, LDA, LDB, a_rowmajor, b_rowmajor,
     block_m_base, block_n_base);
   WarpAccumulator acc(M, N, block_m_base, block_n_base);
 
+#ifdef DGEMM_SM80
+#pragma message "use double-buffered shared memory"
+  extern __shared__ double2 shared[]; //double2 shared[4096];
+  mtr.issue_transfer(shared);
+  for (std::size_t k = 0; k < K; k += 16) {
+    asm volatile ("cp.async.wait_all;");
+    __syncthreads();
+    mtr.issue_transfer(shared + (k & 16u ? 0 : 2048));
+    acc.acc_k16(shared + (k & 16u ? 2048 : 0));
+  }
+#else
+  __shared__ double2 shared[2048];
+  double gload[8];
   for (std::size_t k = 0; k < K; k += 16) {
     mtr.load(gload);
     __syncthreads();
@@ -215,7 +308,7 @@ __launch_bounds__(512, 1) __global__ void dgemm_kernel(
     __syncthreads();
     acc.acc_k16(shared);
   }
-
+#endif
   acc.store(C, M, N, LDC, block_m_base, block_n_base);
 }
 
@@ -223,13 +316,20 @@ void dgemm_async(cudaStream_t &stream, const double *devA, const double *devB, d
   std::size_t M, std::size_t N, std::size_t K, bool a_rowmajor, bool b_rowmajor,
   std::size_t LDA, std::size_t LDB, std::size_t LDC) noexcept {
 
-  // matrix C is row_major
+#ifdef DGEMM_SM80
+  unsigned shared_bytes = 65536;
+  cudaFuncSetAttribute(&dgemm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+    shared_bytes);
+#else
+  unsigned shared_bytes = 0;
   cudaFuncSetSharedMemConfig(&dgemm_kernel, cudaSharedMemBankSizeEightByte);
+#endif
 
-  const dim3 grid_size((N + 127u) / 128u * ((M + 127u) / 128u), 1, 1);
+  //TODO: when gridDim.x or gridDim.y exceed device capability, call dgemm_kernel in loops
+  const dim3 grid_size(1, (N+127u) >> 7, (M+127u) >> 7);
   const dim3 block_size(32, 4, 4);
 
-  dgemm_kernel<<<grid_size, block_size, 0, stream>>>(
+  dgemm_kernel<<<grid_size, block_size, shared_bytes, stream>>>(
     devA, devB, devC, M, N, K,
     a_rowmajor, b_rowmajor, LDA, LDB, LDC);
 }
