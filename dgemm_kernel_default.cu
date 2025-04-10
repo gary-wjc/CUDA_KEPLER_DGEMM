@@ -68,7 +68,7 @@ public:
     asm ("cvta.to.shared.u64 %0,%0;":"+l"(begin));
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
-      if (j >= m_mnTasks) tbytes = 0;
+      if (j >= m_mnTasks) break;
       asm volatile ("cp.async.ca.shared.global [%0],[%1],8,%2;"
         ::"l"(begin),"l"(gptr),"r"(tbytes));
       gptr += m_mnStrideBytes;
@@ -96,7 +96,7 @@ public:
       }
     }
   }
-  __device__ void store(const double (&recv)[8], double2 (&shared)[2048]) const {
+  __device__ void store(const double (&recv)[8], double2 *shared) const {
     unsigned baseoff = (threadIdx.z * blockDim.y + threadIdx.y & 8) << 8;
     double *begin = (&shared[0].x) + baseoff + m_sharedFirstPos;
 #pragma unroll
@@ -118,9 +118,9 @@ public:
     std::size_t mpos_start = block_m_base + (threadIdx.z << 5);
     m_calcValid = npos_start < N && mpos_start < M;
   }
-#ifdef DGEMM_SM80
   __device__ void acc_k16(const double2 *shared) {
     if (!m_calcValid) return;
+#ifdef DGEMM_SM80
 #pragma message "use tensor core"
     unsigned mnstartdiv2 = threadIdx.x >> 2;
     unsigned kstartdiv2 = (threadIdx.x & 3) << 1;
@@ -163,10 +163,7 @@ public:
     astart = &abase[offins32];
     bstart = &bbase[offins32];
     acc_k4();
-  }
 #else
-  __device__ void acc_k16(const double2 (&shared)[2048]) {
-    if (!m_calcValid) return;
     unsigned mstartdiv2 = (threadIdx.x & 3) << 1;
     unsigned nstartdiv2 = threadIdx.x >> 2;
     const double2 *astart = &shared[threadIdx.z * 256u + mstartdiv2 + 1];
@@ -215,8 +212,8 @@ public:
     astart = &shared[threadIdx.z * 256u + mstartdiv2 * 17];
     bstart = &shared[(threadIdx.y+4) * 256u + nstartdiv2 * 17];
     acc_k1(17);
-  }
 #endif
+  }
   __device__ void store(double *C, std::size_t M, std::size_t N, std::size_t LDC,
     std::size_t block_m_base, std::size_t block_n_base) {
 
@@ -276,8 +273,10 @@ __launch_bounds__(512, 1) __global__ void dgemm_kernel(
   const unsigned mblks = (M+127u) >> 7;
   if (nblkid < (nblks & unsigned(-4)) &&
     mblkid < (mblks & unsigned(-4))) {
-    //perform transposed mapping of (4, nblks&-4) to increase L2-cache hit rate
-    unsigned new_mblkid = (mblkid & unsigned(-4)) | (nblkid & 3u);
+    //perform reordered mapping of (4, nblks&-4) to increase L2-cache hit rate
+    unsigned short submid = nblkid & 3u;
+    if (nblkid & 4u) submid = 3u - submid;
+    unsigned new_mblkid = (mblkid & unsigned(-4)) | submid;
     nblkid = (nblkid >> 2) + (nblks >> 2) * (mblkid & 3u);
     mblkid = new_mblkid;
   }
@@ -288,18 +287,18 @@ __launch_bounds__(512, 1) __global__ void dgemm_kernel(
     block_m_base, block_n_base);
   WarpAccumulator acc(M, N, block_m_base, block_n_base);
 
+  extern __shared__ double2 shared[]; //double2 shared[2048];
 #ifdef DGEMM_SM80
 #pragma message "use double-buffered shared memory"
-  extern __shared__ double2 shared[]; //double2 shared[4096];
+  __shared__ double2 shared2[2048];
   mtr.issue_transfer(shared);
   for (std::size_t k = 0; k < K; k += 16) {
     asm volatile ("cp.async.wait_all;");
     __syncthreads();
-    mtr.issue_transfer(shared + (k & 16u ? 0 : 2048));
-    acc.acc_k16(shared + (k & 16u ? 2048 : 0));
+    mtr.issue_transfer(k & 16u ? shared : shared2);
+    acc.acc_k16(k & 16u ? shared2 : shared);
   }
 #else
-  __shared__ double2 shared[2048];
   double gload[8];
   for (std::size_t k = 0; k < K; k += 16) {
     mtr.load(gload);
@@ -316,14 +315,10 @@ void dgemm_async(cudaStream_t &stream, const double *devA, const double *devB, d
   std::size_t M, std::size_t N, std::size_t K, bool a_rowmajor, bool b_rowmajor,
   std::size_t LDA, std::size_t LDB, std::size_t LDC) noexcept {
 
-#ifdef DGEMM_SM80
-  unsigned shared_bytes = 65536;
+  unsigned shared_bytes = 32768;
   cudaFuncSetAttribute(&dgemm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
     shared_bytes);
-#else
-  unsigned shared_bytes = 0;
   cudaFuncSetSharedMemConfig(&dgemm_kernel, cudaSharedMemBankSizeEightByte);
-#endif
 
   //TODO: when gridDim.x or gridDim.y exceed device capability, call dgemm_kernel in loops
   const dim3 grid_size(1, (N+127u) >> 7, (M+127u) >> 7);
