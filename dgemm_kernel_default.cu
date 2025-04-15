@@ -75,6 +75,7 @@ public:
       begin += 256;
     }
     m_gPtr += m_kStrideBytes;
+    asm volatile ("cp.async.commit_group;");
   }
 #endif
   __device__ void load(double (&recv)[8]) {
@@ -137,12 +138,20 @@ public:
         const double2 &bv = b[nseg];
 #pragma unroll
         for (short mseg = 0; mseg < 2; ++mseg) {
-          const double2 &av = a[nseg];
+          const double2 &av = a[mseg];
           asm (
+#if __CUDA_ARCH__ >= 900
+#pragma message "optimize for Hopper arch"
+            "mma.sync.aligned.m16n8k4.row.col.f64.f64.f64.f64"
+	      " {%0,%1,%4,%5},{%8,%9},{%10},{%0,%1,%4,%5};"
+            "mma.sync.aligned.m16n8k4.row.col.f64.f64.f64.f64"
+	      " {%2,%3,%6,%7},{%8,%9},{%11},{%2,%3,%6,%7};"
+#else
             "mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 {%0,%1},{%8},{%10},{%0,%1};"
             "mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 {%2,%3},{%8},{%11},{%2,%3};"
             "mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 {%4,%5},{%9},{%10},{%4,%5};"
             "mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 {%6,%7},{%9},{%11},{%6,%7};"
+#endif
            :"+d"(m_acc[nseg][mseg][0][0].x),"+d"(m_acc[nseg][mseg][0][1].x),
             "+d"(m_acc[nseg][mseg][0][0].y),"+d"(m_acc[nseg][mseg][0][1].y),
             "+d"(m_acc[nseg][mseg][1][0].x),"+d"(m_acc[nseg][mseg][1][1].x),
@@ -159,7 +168,7 @@ public:
     bstart += 9u;
     acc_k4();
     if (kstartdiv2 == 6) offins32 = mnstartdiv2 * 17u;
-    else offins32 = mnstartdiv2 + 1 + kstartdiv2 * 17u + 25u;
+    else offins32 += 25u;
     astart = &abase[offins32];
     bstart = &bbase[offins32];
     acc_k4();
@@ -293,9 +302,9 @@ __launch_bounds__(512, 1) __global__ void dgemm_kernel(
   __shared__ double2 shared2[2048];
   mtr.issue_transfer(shared);
   for (std::size_t k = 0; k < K; k += 16) {
-    asm volatile ("cp.async.wait_all;");
-    __syncthreads();
     mtr.issue_transfer(k & 16u ? shared : shared2);
+    asm volatile ("cp.async.wait_group 1;");
+    __syncthreads();
     acc.acc_k16(k & 16u ? shared2 : shared);
   }
 #else
