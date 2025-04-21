@@ -5,6 +5,8 @@
 
 #include <cassert>
 #include <cstddef>
+#include <stdexcept>
+#include <string>
 
 struct GLoadFirstPos {
   const unsigned m_mMod16, m_kMod16;
@@ -273,7 +275,7 @@ public:
 __launch_bounds__(512, 1) __global__ void dgemm_kernel(
   const double *A, const double *B, double *C,
   std::size_t M, std::size_t N, std::size_t K, bool a_rowmajor, bool b_rowmajor,
-  std::size_t LDA, std::size_t LDB, std::size_t LDC) {
+  std::size_t LDA, std::size_t LDB, std::size_t LDC, unsigned char shared_folds) {
 
   assert(blockDim.y == 4 && blockDim.z == 4);
   unsigned nblkid = blockIdx.y;
@@ -296,17 +298,44 @@ __launch_bounds__(512, 1) __global__ void dgemm_kernel(
     block_m_base, block_n_base);
   WarpAccumulator acc(M, N, block_m_base, block_n_base);
 
-  extern __shared__ double2 shared[]; //double2 shared[2048];
+  extern __shared__ double2 shared[]; //double2 shared[2048*shared_folds];
 #ifdef DGEMM_SM80
-#pragma message "use double-buffered shared memory"
-  __shared__ double2 shared2[2048];
-  mtr.issue_transfer(shared);
-  for (std::size_t k = 0; k < K; k += 16) {
-    mtr.issue_transfer(k & 16u ? shared : shared2);
-    asm volatile ("cp.async.wait_group 1;");
-    __syncthreads();
-    acc.acc_k16(k & 16u ? shared2 : shared);
-  }
+#pragma message "use triple-buffered shared memory"
+  if (shared_folds >= 2) {
+    double2 *sh1 = shared, *sh2 = shared + 2048;
+    mtr.issue_transfer(sh1);
+    if (shared_folds >= 3) {
+      double2 *sh3 = shared + 4096;
+      for (std::size_t k = 0; k < K; k += 16) {
+        mtr.issue_transfer(sh2);
+        asm volatile ("cp.async.wait_group 1;");
+        __syncthreads();
+        acc.acc_k16(sh1);
+        auto tmp = sh1;
+        sh1 = sh2;
+        sh2 = sh3;
+        sh3 = tmp;
+      }
+    } else {
+      for (std::size_t k = 0; k < K; k += 16) {
+        asm volatile ("cp.async.wait_group 0;");
+        __syncthreads();
+        mtr.issue_transfer(sh2);
+        acc.acc_k16(sh1);
+        auto tmp = sh1;
+        sh1 = sh2;
+        sh2 = tmp;
+      }
+    }
+  } else {
+    for (std::size_t k = 0; k < K; k += 16) {
+      mtr.issue_transfer(shared);
+      asm volatile ("cp.async.wait_group 0;");
+      __syncthreads();
+      acc.acc_k16(shared);
+      __syncthreads();
+    }
+  }  
 #else
   double gload[8];
   for (std::size_t k = 0; k < K; k += 16) {
@@ -324,7 +353,17 @@ void dgemm_async(cudaStream_t &stream, const double *devA, const double *devB, d
   std::size_t M, std::size_t N, std::size_t K, bool a_rowmajor, bool b_rowmajor,
   std::size_t LDA, std::size_t LDB, std::size_t LDC) noexcept {
 
-  unsigned shared_bytes = 32768;
+  int shared_bytes = 0, shared_folds = -1;
+  int dev_id;
+  if (cudaGetDevice(&dev_id) == cudaSuccess && cudaDeviceGetAttribute(
+    &shared_bytes, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev_id) == cudaSuccess) {
+
+    shared_folds = shared_bytes >> 15;
+    if (!shared_folds) throw std::runtime_error("only " + 
+      std::to_string(shared_bytes) + " bytes of shared memory");
+  }
+  if (shared_folds < 0) throw std::runtime_error("fail to acquire max shared bytes");
+  shared_bytes = shared_folds << 15;
   cudaFuncSetAttribute(&dgemm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
     shared_bytes);
   cudaFuncSetSharedMemConfig(&dgemm_kernel, cudaSharedMemBankSizeEightByte);
@@ -335,5 +374,5 @@ void dgemm_async(cudaStream_t &stream, const double *devA, const double *devB, d
 
   dgemm_kernel<<<grid_size, block_size, shared_bytes, stream>>>(
     devA, devB, devC, M, N, K,
-    a_rowmajor, b_rowmajor, LDA, LDB, LDC);
+    a_rowmajor, b_rowmajor, LDA, LDB, LDC, shared_folds);
 }
