@@ -304,7 +304,26 @@ __launch_bounds__(512, 1) __global__ void dgemm_kernel(
   if (shared_folds >= 2) {
     double2 *sh1 = shared, *sh2 = shared + 2048;
     mtr.issue_transfer(sh1);
-    if (shared_folds >= 3) {
+    if (shared_folds >= 6) {
+      sh2 += 2048;
+      double2 *sh3 = shared + 8192;
+      mtr.issue_transfer(sh1 + 2048);
+      mtr.issue_transfer(sh2);
+      mtr.issue_transfer(sh2 + 2048);
+      for (std::size_t k = 0; k < K; k += 32) {
+        asm volatile ("cp.async.wait_group 2;");
+        __syncthreads();
+        acc.acc_k16(sh1);
+        if (k + 16 >= K) break;
+        mtr.issue_transfer(sh3);
+        mtr.issue_transfer(sh3 + 2048);
+        acc.acc_k16(sh1 + 2048);
+        auto tmp = sh1;
+        sh1 = sh2;
+        sh2 = sh3;
+        sh3 = tmp;
+      }
+    } else if (shared_folds >= 3) {
       double2 *sh3 = shared + 4096;
       for (std::size_t k = 0; k < K; k += 16) {
         mtr.issue_transfer(sh2);
@@ -351,7 +370,7 @@ __launch_bounds__(512, 1) __global__ void dgemm_kernel(
 
 void dgemm_async(cudaStream_t &stream, const double *devA, const double *devB, double *devC,
   std::size_t M, std::size_t N, std::size_t K, bool a_rowmajor, bool b_rowmajor,
-  std::size_t LDA, std::size_t LDB, std::size_t LDC) noexcept {
+  std::size_t LDA, std::size_t LDB, std::size_t LDC) {
 
   int shared_bytes = 0, shared_folds = -1;
   int dev_id;
@@ -363,6 +382,8 @@ void dgemm_async(cudaStream_t &stream, const double *devA, const double *devB, d
       std::to_string(shared_bytes) + " bytes of shared memory");
   }
   if (shared_folds < 0) throw std::runtime_error("fail to acquire max shared bytes");
+  if (shared_folds > 6) shared_folds = 6;
+  else if (shared_folds > 3) shared_folds = 3;
   shared_bytes = shared_folds << 15;
   cudaFuncSetAttribute(&dgemm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
     shared_bytes);
