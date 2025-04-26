@@ -54,6 +54,7 @@ public:
     std::size_t mn_tasks = get_tasks(mn_first, mn_max);
     m_mnTasks = mn_tasks > 8 ? 8u : mn_tasks;
     m_kTasks = get_tasks(koff, K);
+    m_sharedFirstPos += select_b << 11;
   }
 #ifdef DGEMM_SM80
 #pragma message "enable cp.async"
@@ -65,8 +66,7 @@ public:
     }
     auto gptr = m_gPtr;
     asm ("cvta.to.global.u64 %0,%0;":"+l"(gptr));
-    unsigned baseoff = (threadIdx.z * blockDim.y + threadIdx.y & 8) << 8;
-    double *begin = (&shared[0].x) + baseoff + m_sharedFirstPos;
+    double *begin = (&shared[0].x) + m_sharedFirstPos;
     asm ("cvta.to.shared.u64 %0,%0;":"+l"(begin));
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
@@ -100,8 +100,7 @@ public:
     }
   }
   __device__ void store(const double (&recv)[8], double2 *shared) const {
-    unsigned baseoff = (threadIdx.z * blockDim.y + threadIdx.y & 8) << 8;
-    double *begin = (&shared[0].x) + baseoff + m_sharedFirstPos;
+    double *begin = (&shared[0].x) + m_sharedFirstPos;
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
       if (j < m_mnTasks) begin[j << 8] = recv[j];
@@ -112,6 +111,16 @@ public:
 class WarpAccumulator {
   double2 m_acc[2][2][2][2];
   bool m_calcValid;
+#ifdef DGEMM_SM80
+  unsigned m_firstOff, m_lastOff;
+  __device__ static uint2 getOffInWarp() {
+    unsigned mnstartdiv2 = threadIdx.x >> 2;
+    unsigned kstartdiv2 = (threadIdx.x & 3) << 1;
+    unsigned offins32 = mnstartdiv2 + 1 + kstartdiv2 * 17u;
+    unsigned lastoff = kstartdiv2 == 6 ? mnstartdiv2 * 17u : offins32 + 25u;
+    return make_uint2(offins32, lastoff);
+  }
+#endif
 public:
   __device__ WarpAccumulator(std::size_t M, std::size_t N,
     std::size_t block_m_base, std::size_t block_n_base): m_acc{} {
@@ -120,18 +129,20 @@ public:
     std::size_t npos_start = block_n_base + (threadIdx.y << 5);
     std::size_t mpos_start = block_m_base + (threadIdx.z << 5);
     m_calcValid = npos_start < N && mpos_start < M;
+#ifdef DGEMM_SM80
+    uint2 offs = getOffInWarp();
+    m_firstOff = offs.x;
+    m_lastOff = offs.y;
+#endif
   }
   __device__ void acc_k16(const double2 *shared) {
     if (!m_calcValid) return;
 #ifdef DGEMM_SM80
 #pragma message "use tensor core"
-    unsigned mnstartdiv2 = threadIdx.x >> 2;
-    unsigned kstartdiv2 = (threadIdx.x & 3) << 1;
-    unsigned offins32 = mnstartdiv2 + 1 + kstartdiv2 * 17u;
     const double2 *abase = &shared[threadIdx.z * 256u];
     const double2 *bbase = &shared[(threadIdx.y+4) * 256u];
-    const double2 *astart = &abase[offins32];
-    const double2 *bstart = &bbase[offins32];
+    const double2 *astart = &abase[m_firstOff];
+    const double2 *bstart = &bbase[m_firstOff];
     auto acc_k4 = [&]()->void {
       double2 a[2] = { *astart, astart[128] };
       double2 b[2] = { *bstart, bstart[128] };
@@ -169,10 +180,8 @@ public:
     astart += 9u;
     bstart += 9u;
     acc_k4();
-    if (kstartdiv2 == 6) offins32 = mnstartdiv2 * 17u;
-    else offins32 += 25u;
-    astart = &abase[offins32];
-    bstart = &bbase[offins32];
+    astart = &abase[m_lastOff];
+    bstart = &bbase[m_lastOff];
     acc_k4();
 #else
     unsigned mstartdiv2 = (threadIdx.x & 3) << 1;
