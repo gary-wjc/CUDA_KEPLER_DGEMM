@@ -68,9 +68,8 @@ public:
     asm ("cvta.to.global.u64 %0,%0;":"+l"(gptr));
     double *begin = (&shared[0].x) + m_sharedFirstPos;
     asm ("cvta.to.shared.u64 %0,%0;":"+l"(begin));
-#pragma unroll
-    for (int j = 0; j < 8; ++j) {
-      if (j >= m_mnTasks) break;
+#pragma unroll 1
+    for (unsigned j = 0; j < m_mnTasks; ++j) {
       asm volatile ("cp.async.ca.shared.global [%0],[%1],8,%2;"
         ::"l"(begin),"l"(gptr),"r"(tbytes));
       gptr += m_mnStrideBytes;
@@ -110,7 +109,8 @@ public:
 
 class WarpAccumulator {
   double2 m_acc[2][2][2][2];
-  bool m_calcValid;
+  unsigned m_warpValidMN;
+  double *m_warpCStart;
 #ifdef DGEMM_SM80
   unsigned m_firstOff, m_lastOff;
   __device__ static uint2 getOffInWarp() {
@@ -122,13 +122,22 @@ class WarpAccumulator {
   }
 #endif
 public:
-  __device__ WarpAccumulator(std::size_t M, std::size_t N,
+  __device__ WarpAccumulator(double *C, std::size_t LDC, std::size_t M, std::size_t N,
     std::size_t block_m_base, std::size_t block_n_base): m_acc{} {
 
     assert(blockDim.y == 4 && blockDim.z == 4 && blockDim.x == 32);
     std::size_t npos_start = block_n_base + (threadIdx.y << 5);
     std::size_t mpos_start = block_m_base + (threadIdx.z << 5);
-    m_calcValid = npos_start < N && mpos_start < M;
+    auto getvalid = [](std::size_t start, std::size_t end)->unsigned short {
+      if (end <= start) return 0;
+      if (start + 32u <= end) return 32u;
+      return end - start;
+    };
+    unsigned validn = getvalid(npos_start, N);
+    unsigned validm = getvalid(mpos_start, M);
+    if (!validm || !validn) validm = validn = 0;
+    m_warpValidMN = validn | (validm << 16);
+    m_warpCStart = C + npos_start + mpos_start * LDC;
 #ifdef DGEMM_SM80
     uint2 offs = getOffInWarp();
     m_firstOff = offs.x;
@@ -136,7 +145,7 @@ public:
 #endif
   }
   __device__ void acc_k16(const double2 *shared) {
-    if (!m_calcValid) return;
+    if (!m_warpValidMN) return;
 #ifdef DGEMM_SM80
 #pragma message "use tensor core"
     const double2 *abase = &shared[threadIdx.z * 256u];
@@ -234,13 +243,14 @@ public:
     acc_k1(17);
 #endif
   }
-  __device__ void store(double *C, std::size_t M, std::size_t N, std::size_t LDC,
+  __device__ void store(std::size_t LDC,
     std::size_t block_m_base, std::size_t block_n_base) {
 
-    if (!m_calcValid) return;
-    std::size_t npos_start = block_n_base + (threadIdx.y << 5) +
+    if (!m_warpValidMN) return;
+    unsigned warpvalidm = m_warpValidMN >> 16, warpvalidn = m_warpValidMN & 0xFFFF;
+    unsigned npos_start =
       (threadIdx.x & 1) + (threadIdx.x >> 2 << 1);
-    std::size_t mpos_start = block_m_base + (threadIdx.z << 5) +
+    unsigned mpos_start =
       ((threadIdx.x & 2) << 2);
     #pragma unroll
     for (short nseg = 0; nseg < 2; ++nseg) {
@@ -260,12 +270,12 @@ public:
           m_acc[nseg][mseg][0][0] = t0;
           m_acc[nseg][mseg][0][1] = t1;
         }
-        std::size_t mpos = mpos_start + mseg * 16u;
-        std::size_t npos = npos_start + nseg * 16u;
+        unsigned mpos = mpos_start + mseg * 16u;
+        unsigned npos = npos_start + nseg * 16u;
         auto store2 = [&](double2 val)->void {
-          if (npos < N) {
-            if (mpos < M) C[mpos * LDC + npos] += val.x;
-            if (mpos + 1u < M) C[(mpos+1u) * LDC + npos] += val.y;
+          if (npos < warpvalidn) {
+            if (mpos < warpvalidm) m_warpCStart[mpos * LDC + npos] += val.x;
+            if (mpos + 1u < warpvalidm) m_warpCStart[(mpos+1u) * LDC + npos] += val.y;
           }
         };
 	store2(m_acc[nseg][mseg][0][0]);
@@ -305,7 +315,7 @@ __launch_bounds__(512, 1) __global__ void dgemm_kernel(
   if (block_m_base >= M || block_n_base >= N) return;
   MemTransfer mtr(A, B, M, N, K, LDA, LDB, a_rowmajor, b_rowmajor,
     block_m_base, block_n_base);
-  WarpAccumulator acc(M, N, block_m_base, block_n_base);
+  WarpAccumulator acc(C, LDC, M, N, block_m_base, block_n_base);
 
   extern __shared__ double2 shared[]; //double2 shared[2048*shared_folds];
 #ifdef DGEMM_SM80
@@ -374,7 +384,7 @@ __launch_bounds__(512, 1) __global__ void dgemm_kernel(
     acc.acc_k16(shared);
   }
 #endif
-  acc.store(C, M, N, LDC, block_m_base, block_n_base);
+  acc.store(LDC, block_m_base, block_n_base);
 }
 
 void dgemm_async(cudaStream_t &stream, const double *devA, const double *devB, double *devC,
