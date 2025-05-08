@@ -59,19 +59,24 @@ public:
 #ifdef DGEMM_SM80
 #pragma message "enable cp.async"
   __device__ void issue_transfer(double2 *shared) {
-    unsigned tbytes = 0;
-    if (m_kTasks) {
-      tbytes = 8;
-      m_kTasks--;
+    double *begin = (&shared[0].x) + m_sharedFirstPos;
+    if (!m_kTasks) {
+#pragma unroll 1
+      for (unsigned j = 0; j < m_mnTasks; ++j) {
+        *begin = 0;
+        begin += 256;
+      }
+      asm volatile ("cp.async.commit_group;");
+      return;
     }
+    m_kTasks--;
     auto gptr = m_gPtr;
     asm ("cvta.to.global.u64 %0,%0;":"+l"(gptr));
-    double *begin = (&shared[0].x) + m_sharedFirstPos;
     asm ("cvta.to.shared.u64 %0,%0;":"+l"(begin));
 #pragma unroll 1
     for (unsigned j = 0; j < m_mnTasks; ++j) {
-      asm volatile ("cp.async.ca.shared.global [%0],[%1],8,%2;"
-        ::"l"(begin),"l"(gptr),"r"(tbytes));
+      asm volatile ("cp.async.ca.shared.global [%0],[%1],8;"
+        ::"l"(begin),"l"(gptr));
       gptr += m_mnStrideBytes;
       begin += 256;
     }
@@ -243,9 +248,7 @@ public:
     acc_k1(17);
 #endif
   }
-  __device__ void store(std::size_t LDC,
-    std::size_t block_m_base, std::size_t block_n_base) {
-
+  __device__ void store(std::size_t LDC) {
     if (!m_warpValidMN) return;
     unsigned warpvalidm = m_warpValidMN >> 16, warpvalidn = m_warpValidMN & 0xFFFF;
     unsigned npos_start =
@@ -384,7 +387,7 @@ __launch_bounds__(512, 1) __global__ void dgemm_kernel(
     acc.acc_k16(shared);
   }
 #endif
-  acc.store(LDC, block_m_base, block_n_base);
+  acc.store(LDC);
 }
 
 void dgemm_async(cudaStream_t &stream, const double *devA, const double *devB, double *devC,
